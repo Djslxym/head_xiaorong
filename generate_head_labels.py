@@ -1,5 +1,4 @@
 import os
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -46,13 +45,14 @@ def parse_args():
         "--limit",
         type=int,
         default=0,
-        help="Maximum number of samples to process. 0 means all samples."
+        help="Maximum number of samples. 0 means all samples."
     )
 
     parser.add_argument(
-        "--device_map",
+        "--gpus",
         type=str,
-        default="auto"
+        default="0",
+        help="Physical GPU ID, e.g. 2"
     )
 
     parser.add_argument(
@@ -64,24 +64,173 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(model_path, device_map):
+def configure_gpus(gpu_ids):
+    """
+    Configure visible physical GPU before importing torch.
+
+    Example:
+        --gpus 2
+
+    Physical GPU 2 becomes logical cuda:0.
+    """
+
+    gpu_ids = str(gpu_ids).strip()
+
+    if not gpu_ids:
+        raise ValueError("--gpus cannot be empty.")
+
+    gpu_list = [
+        x.strip()
+        for x in gpu_ids.split(",")
+        if x.strip()
+    ]
+
+    if len(gpu_list) != 1:
+        raise ValueError(
+            "This script currently supports one GPU only. "
+            "Please specify one GPU, e.g. --gpus 2."
+        )
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list[0]
+
+    print("\n========== GPU Configuration ==========")
+    print("Selected physical GPU:", gpu_list[0])
+    print("CUDA_VISIBLE_DEVICES:", os.environ["CUDA_VISIBLE_DEVICES"])
+
+    return gpu_list[0]
+
+
+def load_model(model_path):
+    """
+    Load model on CPU first, then explicitly move the entire
+    model to cuda:0.
+
+    This is the loading strategy verified successfully
+    in the previous script.
+    """
+
     import torch
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+    from transformers import (
+        Qwen2_5_VLForConditionalGeneration,
+        AutoProcessor
+    )
 
     print("\n========== Loading Model ==========")
+    print("PyTorch version:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+    print("Visible GPU count:", torch.cuda.device_count())
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available.")
+
+    if torch.cuda.device_count() < 1:
+        raise RuntimeError("No visible CUDA GPU.")
+
+    print("GPU:", torch.cuda.get_device_name(0))
+
+    free_memory, total_memory = torch.cuda.mem_get_info(0)
+
+    print(
+        "GPU free memory:",
+        round(free_memory / 1024**3, 2),
+        "GB"
+    )
+
+    print(
+        "GPU total memory:",
+        round(total_memory / 1024**3, 2),
+        "GB"
+    )
+
+    if free_memory < 12 * 1024**3:
+        print(
+            "[Warning] Available GPU memory is below 12 GB. "
+            "Model loading or inference may fail."
+        )
+
+    print("\nLoading processor...")
 
     processor = AutoProcessor.from_pretrained(model_path)
+
+    print("\nLoading model on CPU first...")
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
         torch_dtype="auto",
-        device_map=device_map,
+        low_cpu_mem_usage=True,
         attn_implementation="sdpa",
     )
 
     model.eval()
 
-    print("Model loaded successfully.")
+    print("Model loaded on CPU.")
+    print("Model dtype:", next(model.parameters()).dtype)
+
+    print("\nMoving entire model to cuda:0...")
+
+    model = model.to(torch.device("cuda:0"))
+
+    torch.cuda.synchronize()
+
+    print("\n========== Actual Model Device Check ==========")
+
+    embedding_device = (
+        model.get_input_embeddings().weight.device
+    )
+
+    parameter_devices = sorted(
+        set(
+            str(parameter.device)
+            for parameter in model.parameters()
+        )
+    )
+
+    lm_head_device = model.lm_head.weight.device
+
+    print("Input embedding device:", embedding_device)
+    print("Model parameter devices:", parameter_devices)
+    print("LM head device:", lm_head_device)
+
+    if embedding_device.type != "cuda":
+        raise RuntimeError(
+            f"Model embedding is on {embedding_device}, not CUDA."
+        )
+
+    if parameter_devices != ["cuda:0"]:
+        raise RuntimeError(
+            f"Model parameters are not all on cuda:0: "
+            f"{parameter_devices}"
+        )
+
+    if lm_head_device.type != "cuda":
+        raise RuntimeError(
+            f"LM head is not on CUDA: {lm_head_device}"
+        )
+
+    allocated = torch.cuda.memory_allocated(0)
+    reserved = torch.cuda.memory_reserved(0)
+
+    print("\n========== GPU Memory After Loading ==========")
+
+    print(
+        "GPU 0 allocated:",
+        round(allocated / 1024**3, 2),
+        "GB"
+    )
+
+    print(
+        "GPU 0 reserved:",
+        round(reserved / 1024**3, 2),
+        "GB"
+    )
+
+    if allocated < 10 * 1024**3:
+        raise RuntimeError(
+            "GPU memory allocation is unexpectedly low. "
+            "Please check whether the model is fully loaded."
+        )
+
+    print("\nGPU loading verification PASSED.")
 
     return model, processor
 
@@ -89,14 +238,6 @@ def load_model(model_path, device_map):
 def build_messages(row, image_path):
     """
     Construct the RealWorldQA prompt.
-
-    The format follows the local ImageMCQDataset prompt:
-        Question: ...
-        Options:
-        A. ...
-        B. ...
-        ...
-        Please select the correct answer from the options above.
     """
 
     question = str(row["question"]).strip()
@@ -104,6 +245,7 @@ def build_messages(row, image_path):
     option_lines = []
 
     for option in ["A", "B", "C", "D"]:
+
         value = row.get(option, "")
 
         if pd.isna(value):
@@ -152,29 +294,26 @@ def prepare_model_inputs(
     Prepare multimodal prefix/full inputs.
 
     Prefix:
-        system + user + assistant generation prompt
+        user image + question + options + assistant generation prompt
 
     Full:
-        system + user + assistant answer
+        Prefix + ground-truth answer
 
-    The answer token position is determined from actual processor
-    tokenization, not from string length.
+    The answer token position is determined from actual
+    processor tokenization.
     """
 
     import torch
     from qwen_vl_utils import process_vision_info
 
-    # Obtain image inputs from the original multimodal messages.
     image_inputs, video_inputs = process_vision_info(messages)
 
-    # Prefix text: the model has not generated the answer yet.
     prefix_text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    # Full text: append the ground-truth answer.
     full_messages = messages + [
         {
             "role": "assistant",
@@ -197,13 +336,11 @@ def prepare_model_inputs(
     if video_inputs is not None:
         common_kwargs["videos"] = video_inputs
 
-    # Process prefix.
     prefix_inputs = processor(
         text=[prefix_text],
         **common_kwargs
     )
 
-    # Process full conversation.
     full_inputs = processor(
         text=[full_text],
         **common_kwargs
@@ -220,17 +357,15 @@ def prepare_model_inputs(
             "Cannot locate answer token."
         )
 
-    # Check that the actual tokenized prefix is identical.
     if not torch.equal(
         prefix_ids[0],
         full_ids[0, :prefix_len]
     ):
         raise RuntimeError(
-            "Prefix token IDs do not match the beginning of full input. "
-            "Cannot safely determine answer token position."
+            "Prefix token IDs do not match the beginning "
+            "of full input. Cannot safely determine answer position."
         )
 
-    # The correct answer should be one token: A/B/C/D.
     answer_token_ids = processor.tokenizer(
         answer,
         add_special_tokens=False
@@ -243,7 +378,11 @@ def prepare_model_inputs(
         )
 
     answer_position = prefix_len
-    target_token_id = full_ids[0, answer_position].item()
+
+    target_token_id = full_ids[
+        0,
+        answer_position
+    ].item()
 
     if target_token_id != answer_token_ids[0]:
         raise RuntimeError(
@@ -252,12 +391,12 @@ def prepare_model_inputs(
             f"got {target_token_id}."
         )
 
-    # The model input tensors should be placed on the input embedding device.
     input_device = model.get_input_embeddings().weight.device
 
     model_inputs = {}
 
     for key, value in full_inputs.items():
+
         if torch.is_tensor(value):
             model_inputs[key] = value.to(input_device)
         else:
@@ -273,17 +412,25 @@ def calculate_answer_loss(
     target_token_id
 ):
     """
-    Calculate NLL of the ground-truth answer token.
+    Original full-logits Loss calculation.
 
-    The answer token at position t is predicted by logits at position t-1.
+    IMPORTANT:
+        Do not optimize this implementation.
+
+    The model calculates logits for the entire sequence.
+    Then the logits at answer_position - 1 are selected
+    to predict the ground-truth answer token.
     """
 
     import torch
     import torch.nn.functional as F
 
     with torch.inference_mode():
+
+        # Keep the original full model forward.
         outputs = model(**model_inputs)
 
+        # Original full-vocabulary logits at answer prediction position.
         answer_logits = outputs.logits[
             0,
             answer_position - 1,
@@ -296,6 +443,7 @@ def calculate_answer_loss(
             device=answer_logits.device
         )
 
+        # Original cross entropy calculation.
         loss = F.cross_entropy(
             answer_logits.unsqueeze(0),
             target
@@ -319,11 +467,9 @@ def install_dynamic_head_hook(model, layer_index):
         No ablation, normal forward.
 
     state["head"] = h:
-        Zero the 128-dimensional output of Query Head h
-        before o_proj.
+        Zero the 128-dimensional segment corresponding
+        to Query Head h before o_proj.
     """
-
-    import torch
 
     layers = model.model.language_model.layers
 
@@ -337,6 +483,7 @@ def install_dynamic_head_hook(model, layer_index):
 
     num_heads = attention.num_heads
     head_dim = attention.head_dim
+
     input_dim = attention.o_proj.in_features
 
     if input_dim != num_heads * head_dim:
@@ -358,9 +505,9 @@ def install_dynamic_head_hook(model, layer_index):
     }
 
     def dynamic_ablation_hook(module, inputs):
+
         head_index = state["head"]
 
-        # Normal forward: no ablation.
         if head_index is None:
             return None
 
@@ -369,10 +516,8 @@ def install_dynamic_head_hook(model, layer_index):
         start = head_index * head_dim
         end = start + head_dim
 
-        # Clone to avoid modifying the original tensor in-place.
         modified = hidden_states.clone()
 
-        # Zero the selected Query Head's output dimensions.
         modified[..., start:end] = 0
 
         return (modified,) + tuple(inputs[1:])
@@ -397,11 +542,12 @@ def calculate_sample_losses(
     """
     Calculate:
         1 baseline loss
-        28 single-head ablation losses
+        N single-head ablation losses
     """
 
-    # Baseline: no Head is ablated.
     state["head"] = None
+
+    print("\nCalculating baseline loss...")
 
     baseline_loss = calculate_answer_loss(
         model,
@@ -410,9 +556,10 @@ def calculate_sample_losses(
         target_token_id
     )
 
+    print(f"Baseline loss: {baseline_loss:.6f}")
+
     head_losses = []
 
-    # Ablate each Query Head separately.
     for head_index in range(num_heads):
 
         state["head"] = head_index
@@ -435,7 +582,6 @@ def calculate_sample_losses(
 
     print()
 
-    # Restore normal forward state.
     state["head"] = None
 
     return baseline_loss, head_losses
@@ -447,13 +593,10 @@ def generate_labels(
     eps
 ):
     """
-    Calculate:
-        delta_h = max(0, L_h - L_base)
+    delta_h = max(0, L_h - L_base)
 
-        q_h = delta_h / sum(delta)
+    q_h = delta_h / sum(delta)
     """
-
-    import numpy as np
 
     deltas = [
         max(0.0, loss - baseline_loss)
@@ -463,13 +606,17 @@ def generate_labels(
     delta_sum = sum(deltas)
 
     if delta_sum <= eps:
+
         target_weights = [0.0] * len(deltas)
         valid = False
+
     else:
+
         target_weights = [
             delta / delta_sum
             for delta in deltas
         ]
+
         valid = True
 
     return deltas, target_weights, valid
@@ -477,7 +624,7 @@ def generate_labels(
 
 def load_processed_ids(output_path):
     """
-    Read existing JSONL results for resume support.
+    Read existing successful JSONL results for resume support.
     """
 
     processed_ids = set()
@@ -486,17 +633,22 @@ def load_processed_ids(output_path):
         return processed_ids
 
     with open(output_path, "r", encoding="utf-8") as f:
+
         for line in f:
+
             line = line.strip()
 
             if not line:
                 continue
 
             try:
+
                 record = json.loads(line)
 
                 if record.get("status") == "success":
-                    processed_ids.add(str(record["sample_id"]))
+                    processed_ids.add(
+                        str(record["sample_id"])
+                    )
 
             except Exception:
                 continue
@@ -510,26 +662,34 @@ def append_jsonl(output_path, record):
     """
 
     with open(output_path, "a", encoding="utf-8") as f:
+
         f.write(
             json.dumps(
                 record,
                 ensure_ascii=False
             ) + "\n"
         )
+
         f.flush()
 
 
 def main():
+
     args = parse_args()
 
-    # Set CUDA-related environment before loading torch/model.
-    # Select GPU in shell with CUDA_VISIBLE_DEVICES.
-    print("========== Arguments ==========")
+    # Configure GPU before importing torch.
+    physical_gpu = configure_gpus(args.gpus)
+
+    import torch
+
+    print("\n========== Arguments ==========")
     print("Model:", args.model_path)
     print("Dataset:", args.data_path)
     print("Image root:", args.image_root)
     print("Layer:", args.layer)
     print("Limit:", args.limit)
+    print("Physical GPU:", physical_gpu)
+    print("Device: cuda:0")
     print("Output:", args.output)
 
     if not os.path.isfile(args.data_path):
@@ -540,7 +700,6 @@ def main():
         exist_ok=True
     )
 
-    # Read dataset.
     df = pd.read_csv(
         args.data_path,
         sep="\t"
@@ -557,6 +716,7 @@ def main():
     ]
 
     for column in required_columns:
+
         if column not in df.columns:
             raise RuntimeError(
                 f"Missing dataset column: {column}"
@@ -570,8 +730,7 @@ def main():
 
     # Load model only once.
     model, processor = load_model(
-        args.model_path,
-        args.device_map
+        args.model_path
     )
 
     # Install one dynamic hook.
@@ -592,6 +751,7 @@ def main():
     skipped_count = 0
 
     try:
+
         for position, (_, row) in enumerate(df.iterrows()):
 
             sample_id = str(
@@ -607,10 +767,12 @@ def main():
             answer = str(row["answer"]).strip().upper()
 
             if answer not in ["A", "B", "C", "D"]:
+
                 print(
                     f"\n[Skip] Sample {sample_id}: "
                     f"Invalid answer {answer!r}"
                 )
+
                 error_count += 1
                 continue
 
@@ -622,32 +784,38 @@ def main():
                 image_path = Path(args.image_root) / image_path
 
             if not image_path.exists():
-                # Some TSV files store only the image filename,
-                # while others store a relative path.
+
                 fallback_path = (
                     Path(args.image_root) /
                     Path(image_name).name
                 )
 
                 if fallback_path.exists():
+
                     image_path = fallback_path
+
                 else:
+
                     print(
                         f"\n[Error] Image not found: {image_path}"
                     )
+
                     error_count += 1
                     continue
 
             print("\n" + "=" * 65)
+
             print(
                 f"Sample {sample_id} "
                 f"({position + 1}/{len(df)})"
             )
+
             print("Question:", row["question"])
             print("Ground Truth:", answer)
             print("Image:", image_path)
 
             try:
+
                 messages = build_messages(
                     row,
                     image_path
@@ -662,7 +830,7 @@ def main():
                     )
                 )
 
-                # Baseline + 28 Head ablations.
+                # Baseline + all single-head ablations.
                 baseline_loss, head_losses = (
                     calculate_sample_losses(
                         model,
@@ -711,13 +879,12 @@ def main():
                 print("\n========== Sample Result ==========")
                 print(f"Baseline loss: {baseline_loss:.6f}")
                 print(f"Valid label: {valid}")
+
                 print("Target weights:")
-                print(
-                    [
-                        round(x, 6)
-                        for x in target_weights
-                    ]
-                )
+                print([
+                    round(x, 6)
+                    for x in target_weights
+                ])
 
                 print(
                     f"Completed: {success_count} "
@@ -727,8 +894,12 @@ def main():
                 )
 
                 del model_inputs
+                del messages
+
+                torch.cuda.synchronize()
 
             except Exception as e:
+
                 error_count += 1
 
                 print(
@@ -736,10 +907,8 @@ def main():
                     f"{type(e).__name__}: {e}"
                 )
 
-                # Restore normal forward state after failure.
                 state["head"] = None
 
-                # Record the error for inspection.
                 append_jsonl(
                     args.output,
                     {
@@ -753,6 +922,7 @@ def main():
                 traceback.print_exc()
 
     finally:
+
         state["head"] = None
         hook_handle.remove()
 
@@ -767,4 +937,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
