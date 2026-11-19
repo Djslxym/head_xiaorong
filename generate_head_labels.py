@@ -1,6 +1,3 @@
-cd ~/HAWK/HAWK
-
-cat > generate_head_labels.py <<'PY'
 import os
 import sys
 import json
