@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate sample-wise Attention Head importance labels."
